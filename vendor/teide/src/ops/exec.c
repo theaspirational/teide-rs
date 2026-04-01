@@ -15246,6 +15246,182 @@ static td_t* exec_hnsw_knn(td_graph_t* g, td_op_t* op) {
 }
 
 /* ============================================================================
+ * OP_ANTIJOIN: emit left rows with NO matching right row on key columns.
+ * Output contains only left-side columns. Used for set difference in Datalog.
+ * ============================================================================ */
+
+static td_t* exec_antijoin(td_graph_t* g, td_op_t* op,
+                             td_t* left_table, td_t* right_table) {
+    if (!left_table || TD_IS_ERR(left_table)) return left_table;
+    if (!right_table || TD_IS_ERR(right_table)) return right_table;
+
+    td_op_ext_t* ext = find_ext(g, op->id);
+    if (!ext) return TD_ERR_PTR(TD_ERR_NYI);
+
+    int64_t left_rows = td_table_nrows(left_table);
+    int64_t right_rows = td_table_nrows(right_table);
+    uint8_t n_keys = ext->join.n_join_keys;
+
+    /* Fast paths */
+    if (left_rows == 0) { td_retain(left_table); return left_table; }
+    if (right_rows == 0) { td_retain(left_table); return left_table; }
+    if (left_rows > (int64_t)INT32_MAX || right_rows > (int64_t)INT32_MAX)
+        return TD_ERR_PTR(TD_ERR_NYI);
+
+    /* Resolve key column vectors */
+    td_t* l_key_vecs[256];
+    td_t* r_key_vecs[256];
+    memset(l_key_vecs, 0, n_keys * sizeof(td_t*));
+    memset(r_key_vecs, 0, n_keys * sizeof(td_t*));
+    for (uint8_t k = 0; k < n_keys; k++) {
+        td_op_ext_t* lk = find_ext(g, ext->join.left_keys[k]->id);
+        td_op_ext_t* rk = find_ext(g, ext->join.right_keys[k]->id);
+        if (lk && lk->base.opcode == OP_SCAN)
+            l_key_vecs[k] = td_table_get_col(left_table, lk->sym);
+        if (rk && rk->base.opcode == OP_SCAN)
+            r_key_vecs[k] = td_table_get_col(right_table, rk->sym);
+        if (rk && rk->base.opcode == OP_CONST && rk->literal)
+            r_key_vecs[k] = rk->literal;
+    }
+
+    td_pool_t* pool = td_pool_get();
+    td_t* result = NULL;
+    td_t* ht_next_hdr = NULL;
+    td_t* ht_heads_hdr = NULL;
+    td_t* l_idx_hdr = NULL;
+
+    /* Phase 1: Build chained HT on right side */
+    uint64_t ht_cap64 = 256;
+    uint64_t target = (uint64_t)right_rows * 2;
+    while (ht_cap64 < target) ht_cap64 *= 2;
+    if (ht_cap64 > UINT32_MAX) ht_cap64 = (uint64_t)1 << 31;
+    uint32_t ht_cap = (uint32_t)ht_cap64;
+
+    uint32_t* ht_next = (uint32_t*)scratch_alloc(&ht_next_hdr,
+                            (size_t)right_rows * sizeof(uint32_t));
+    _Atomic(uint32_t)* ht_heads = (_Atomic(uint32_t)*)scratch_alloc(&ht_heads_hdr,
+                                      ht_cap * sizeof(uint32_t));
+    if (!ht_next || !ht_heads) goto antijoin_cleanup;
+    memset(ht_heads, 0xFF, ht_cap * sizeof(uint32_t));
+
+    {
+        join_build_ctx_t bctx = {
+            .ht_heads   = ht_heads,
+            .ht_next    = ht_next,
+            .ht_mask    = ht_cap - 1,
+            .r_key_vecs = r_key_vecs,
+            .n_keys     = n_keys,
+            .asp_bits   = NULL,
+            .asp_key_max = 0,
+        };
+        if (pool && right_rows > TD_PARALLEL_THRESHOLD)
+            td_pool_dispatch(pool, join_build_fn, &bctx, right_rows);
+        else
+            join_build_fn(&bctx, 0, 0, right_rows);
+    }
+    CHECK_CANCEL_GOTO(pool, antijoin_cleanup);
+
+    /* Phase 2: Probe left side, collect non-matching indices */
+    {
+        int64_t* l_idx = (int64_t*)scratch_alloc(&l_idx_hdr,
+                              (size_t)left_rows * sizeof(int64_t));
+        if (!l_idx) goto antijoin_cleanup;
+
+        uint32_t ht_mask = ht_cap - 1;
+        int64_t out_count = 0;
+        for (int64_t l = 0; l < left_rows; l++) {
+            uint64_t h = hash_row_keys(l_key_vecs, n_keys, l);
+            uint32_t slot = (uint32_t)(h & ht_mask);
+            bool matched = false;
+            for (uint32_t r = ht_heads[slot]; r != JHT_EMPTY; r = ht_next[r]) {
+                if (join_keys_eq(l_key_vecs, r_key_vecs, n_keys, l, (int64_t)r)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched)
+                l_idx[out_count++] = l;
+        }
+
+        /* Phase 3: Gather left columns only */
+        int64_t left_ncols = td_table_ncols(left_table);
+        result = td_table_new(left_ncols);
+        if (!result || TD_IS_ERR(result)) goto antijoin_cleanup;
+
+        if (out_count > 0) {
+            td_t* l_out_cols[MGATHER_MAX_COLS];
+            int64_t l_out_names[MGATHER_MAX_COLS];
+            int64_t l_out_count = 0;
+            for (int64_t c = 0; c < left_ncols && l_out_count < MGATHER_MAX_COLS; c++) {
+                td_t* col = td_table_get_col_idx(left_table, c);
+                if (!col) continue;
+                td_t* new_col = col_vec_new(col, out_count);
+                if (!new_col || TD_IS_ERR(new_col)) continue;
+                new_col->len = out_count;
+                l_out_cols[l_out_count] = new_col;
+                l_out_names[l_out_count] = td_table_col_name(left_table, c);
+                l_out_count++;
+            }
+
+            if (l_out_count > 1 && l_out_count <= MGATHER_MAX_COLS) {
+                multi_gather_ctx_t mgctx = { .idx = l_idx, .ncols = l_out_count };
+                int64_t si = 0;
+                for (int64_t c = 0; c < left_ncols && si < l_out_count; c++) {
+                    td_t* col = td_table_get_col_idx(left_table, c);
+                    if (!col) continue;
+                    mgctx.srcs[si] = (char*)td_data(col);
+                    mgctx.dsts[si] = (char*)td_data(l_out_cols[si]);
+                    mgctx.esz[si] = col_esz(col);
+                    si++;
+                }
+                if (pool && out_count > TD_PARALLEL_THRESHOLD)
+                    td_pool_dispatch(pool, multi_gather_fn, &mgctx, out_count);
+                else
+                    multi_gather_fn(&mgctx, 0, 0, out_count);
+            } else {
+                int64_t si = 0;
+                for (int64_t c = 0; c < left_ncols && si < l_out_count; c++) {
+                    td_t* col = td_table_get_col_idx(left_table, c);
+                    if (!col) continue;
+                    gather_ctx_t gctx = {
+                        .idx = l_idx, .src_col = col, .dst_col = l_out_cols[si],
+                        .esz = col_esz(col), .nullable = false,
+                    };
+                    if (pool && out_count > TD_PARALLEL_THRESHOLD)
+                        td_pool_dispatch(pool, gather_fn, &gctx, out_count);
+                    else
+                        gather_fn(&gctx, 0, 0, out_count);
+                    si++;
+                }
+            }
+
+            for (int64_t i = 0; i < l_out_count; i++) {
+                result = td_table_add_col(result, l_out_names[i], l_out_cols[i]);
+                td_release(l_out_cols[i]);
+            }
+        } else {
+            /* All rows matched — return empty table with same schema */
+            for (int64_t c = 0; c < left_ncols; c++) {
+                td_t* col = td_table_get_col_idx(left_table, c);
+                if (!col) continue;
+                td_t* empty_col = td_vec_new(col->type, 0);
+                if (empty_col && !TD_IS_ERR(empty_col)) {
+                    empty_col->len = 0;
+                    result = td_table_add_col(result, td_table_col_name(left_table, c), empty_col);
+                    td_release(empty_col);
+                }
+            }
+        }
+    }
+
+antijoin_cleanup:
+    if (ht_next_hdr) scratch_free(ht_next_hdr);
+    if (ht_heads_hdr) scratch_free(ht_heads_hdr);
+    if (l_idx_hdr) scratch_free(l_idx_hdr);
+    return result;
+}
+
+/* ============================================================================
  * Recursive executor
  * ============================================================================ */
 
@@ -16069,6 +16245,56 @@ static td_t* exec_node(td_graph_t* g, td_op_t* op) {
         }
         case OP_HNSW_KNN: {
             return exec_hnsw_knn(g, op);
+        }
+
+        case OP_UNION_ALL: {
+            td_t* left = exec_node(g, op->inputs[0]);
+            if (!left || TD_IS_ERR(left)) return left;
+            td_t* right = exec_node(g, op->inputs[1]);
+            if (!right || TD_IS_ERR(right)) { td_release(left); return right; }
+            if (left->type != TD_TABLE || right->type != TD_TABLE) {
+                td_release(left); td_release(right);
+                return TD_ERR_PTR(TD_ERR_NYI);
+            }
+            if (td_table_nrows(left) == 0) {
+                td_release(left);
+                return right;
+            }
+            if (td_table_nrows(right) == 0) {
+                td_release(right);
+                return left;
+            }
+            int64_t ncols = td_table_ncols(left);
+            td_t* result = td_table_new(ncols);
+            for (int64_t i = 0; i < ncols; i++) {
+                td_t* lcol = td_table_get_col_idx(left, i);
+                td_t* rcol = td_table_get_col_idx(right, i);
+                int64_t name_id = td_table_col_name(left, i);
+                td_t* merged = td_vec_concat(lcol, rcol);
+                result = td_table_add_col(result, name_id, merged);
+                td_release(merged);
+            }
+            td_release(left);
+            td_release(right);
+            return result;
+        }
+
+        case OP_ANTIJOIN: {
+            td_t* left = exec_node(g, op->inputs[0]);
+            td_t* right = exec_node(g, op->inputs[1]);
+            if (!left || TD_IS_ERR(left)) { if (right && !TD_IS_ERR(right)) td_release(right); return left; }
+            if (!right || TD_IS_ERR(right)) { td_release(left); return right; }
+            if (g->selection && left && !TD_IS_ERR(left) && left->type == TD_TABLE) {
+                td_t* compacted = sel_compact(g, left, g->selection);
+                td_release(left);
+                td_release(g->selection);
+                g->selection = NULL;
+                left = compacted;
+            }
+            td_t* result = exec_antijoin(g, op, left, right);
+            td_release(left);
+            td_release(right);
+            return result;
         }
 
         default:

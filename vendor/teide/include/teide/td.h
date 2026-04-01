@@ -494,6 +494,10 @@ static inline uint8_t td_sym_dict_width(int64_t dict_size) {
 #define OP_CLOSENESS      100   /* closeness centrality                   */
 #define OP_MST            101   /* minimum spanning forest (Kruskal)      */
 
+/* Opcodes — Datalog */
+#define OP_UNION_ALL    102   /* row-union of two same-schema tables */
+#define OP_ANTIJOIN     103   /* anti-join: left rows with NO match in right */
+
 /* Opcodes — Vector similarity */
 #define OP_COSINE_SIM      88   /* cosine similarity between embeddings   */
 #define OP_EUCLIDEAN_DIST  89   /* euclidean distance between embeddings  */
@@ -993,6 +997,13 @@ td_op_t* td_head(td_graph_t* g, td_op_t* input, int64_t n);
 td_op_t* td_tail(td_graph_t* g, td_op_t* input, int64_t n);
 td_op_t* td_alias(td_graph_t* g, td_op_t* input, const char* name);
 td_op_t* td_materialize(td_graph_t* g, td_op_t* input);
+
+/* Convenience helpers for Datalog convergence checks */
+td_op_t* td_union_all(td_graph_t* g, td_op_t* left, td_op_t* right);
+td_op_t* td_antijoin(td_graph_t* g,
+                      td_op_t* left_table, td_op_t** left_keys,
+                      td_op_t* right_table, td_op_t** right_keys,
+                      uint8_t n_keys);
 
 /* ===== Graph Ops ===== */
 

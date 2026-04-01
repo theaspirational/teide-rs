@@ -259,6 +259,8 @@ pub const OP_RANDOM_WALK:   u16 = 98;
 pub const OP_BETWEENNESS:   u16 = 99;
 pub const OP_CLOSENESS:     u16 = 100;
 pub const OP_MST:           u16 = 101;
+pub const OP_UNION_ALL:     u16 = 102;
+pub const OP_ANTIJOIN:      u16 = 103;
 
 // Window function kinds
 pub const TD_WIN_ROW_NUMBER: u8 = 0;
@@ -1150,3 +1152,218 @@ const _: () = {
     assert!(std::mem::size_of::<td_op_ext_t>() == 104);
     assert!(std::mem::size_of::<td_graph_t>() == 64);
 };
+
+// ===== Datalog FFI (feature-gated) =====
+
+#[cfg(feature = "datalog")]
+pub mod datalog_ffi {
+    use super::*;
+
+    // Datalog constants
+    pub const DL_POS: c_int = 0;
+    pub const DL_NEG: c_int = 1;
+    pub const DL_CMP: c_int = 2;
+    pub const DL_ASSIGN: c_int = 3;
+    pub const DL_BUILTIN: c_int = 4;
+    pub const DL_INTERVAL: c_int = 5;
+
+    // Builtin predicate IDs
+    pub const DL_BUILTIN_BEFORE: c_int = 0;
+    pub const DL_BUILTIN_DURATION_SINCE: c_int = 1;
+    pub const DL_BUILTIN_ABS: c_int = 2;
+    pub const DL_BUILTIN_OVERLAPS: c_int = 3;
+    pub const DL_BUILTIN_MEETS: c_int = 4;
+    pub const DL_BUILTIN_DECAY: c_int = 5;
+
+    pub const DL_CMP_EQ: c_int = 0;
+    pub const DL_CMP_NE: c_int = 1;
+    pub const DL_CMP_LT: c_int = 2;
+    pub const DL_CMP_LE: c_int = 3;
+    pub const DL_CMP_GT: c_int = 4;
+    pub const DL_CMP_GE: c_int = 5;
+
+    pub const DL_OP_EQ: c_int = 0;
+
+    pub const DL_CONST: c_int = -1;
+    pub const DL_MAX_ARITY: usize = 16;
+    pub const DL_MAX_BODY: usize = 16;
+    pub const DL_MAX_RULES: usize = 128;
+    pub const DL_MAX_RELS: usize = 64;
+    pub const DL_MAX_STRATA: usize = 16;
+
+    pub const DL_FLAG_PROVENANCE: u32 = 1 << 0;
+
+    // Expression AST
+    #[repr(C)]
+    pub enum dl_expr_kind_t {
+        DL_EXPR_CONST = 0,
+        DL_EXPR_VAR = 1,
+        DL_EXPR_BINOP = 2,
+    }
+
+    #[repr(C)]
+    pub struct dl_expr_t {
+        pub kind: dl_expr_kind_t,
+        pub const_val: i64,
+        pub var_idx: c_int,
+        pub binop: c_int,
+        pub left: *mut dl_expr_t,
+        pub right: *mut dl_expr_t,
+    }
+
+    // Body literal
+    #[repr(C)]
+    pub struct dl_body_t {
+        pub type_: c_int,
+        pub pred: [u8; 64],
+        pub arity: c_int,
+        pub vars: [c_int; DL_MAX_ARITY],
+        pub const_vals: [i64; DL_MAX_ARITY],
+        pub cmp_op: c_int,
+        pub cmp_lhs: c_int,
+        pub cmp_rhs: c_int,
+        pub cmp_const: i64,
+        pub assign_var: c_int,
+        pub assign_expr: *mut dl_expr_t,
+        pub builtin_id: c_int,
+        pub cmp_lhs_expr: *mut dl_expr_t,
+        pub cmp_rhs_expr: *mut dl_expr_t,
+        pub interval_fact_var: c_int,
+        pub interval_start_var: c_int,
+        pub interval_end_var: c_int,
+    }
+
+    // Rule
+    #[repr(C)]
+    pub struct dl_rule_t {
+        pub head_pred: [u8; 64],
+        pub head_arity: c_int,
+        pub head_vars: [c_int; DL_MAX_ARITY],
+        pub head_consts: [i64; DL_MAX_ARITY],
+        pub n_body: c_int,
+        pub body: [dl_body_t; DL_MAX_BODY],
+        pub n_vars: c_int,
+        pub stratum: c_int,
+    }
+
+    // Relation
+    #[repr(C)]
+    pub struct dl_rel_t {
+        pub name: [u8; 64],
+        pub table: *mut td_t,
+        pub arity: c_int,
+        pub is_idb: bool,
+        pub col_names: [i64; DL_MAX_ARITY],
+        pub prov_col: *mut td_t,
+    }
+
+    // Program
+    #[repr(C)]
+    pub struct dl_program_t {
+        pub rels: [dl_rel_t; DL_MAX_RELS],
+        pub n_rels: c_int,
+        pub rules: [dl_rule_t; DL_MAX_RULES],
+        pub n_rules: c_int,
+        pub strata: [[c_int; DL_MAX_RELS]; DL_MAX_STRATA],
+        pub strata_sizes: [c_int; DL_MAX_STRATA],
+        pub n_strata: c_int,
+        pub flags: u32,
+    }
+
+    extern "C" {
+        // Program lifecycle
+        pub fn dl_program_new() -> *mut dl_program_t;
+        pub fn dl_program_free(prog: *mut dl_program_t);
+
+        // EDB/IDB management
+        pub fn dl_add_edb(
+            prog: *mut dl_program_t,
+            name: *const c_char,
+            table: *mut td_t,
+            arity: c_int,
+        ) -> c_int;
+        pub fn dl_add_rule(prog: *mut dl_program_t, rule: *const dl_rule_t) -> c_int;
+        pub fn dl_stratify(prog: *mut dl_program_t) -> c_int;
+        pub fn dl_eval(prog: *mut dl_program_t) -> c_int;
+        pub fn dl_query(prog: *mut dl_program_t, pred_name: *const c_char) -> *mut td_t;
+        pub fn dl_find_rel(prog: *mut dl_program_t, name: *const c_char) -> c_int;
+        pub fn dl_ensure_idb(prog: *mut dl_program_t, name: *const c_char, arity: c_int) -> c_int;
+
+        // Rule builder helpers
+        pub fn dl_rule_init(rule: *mut dl_rule_t, head_pred: *const c_char, head_arity: c_int);
+        pub fn dl_rule_head_var(rule: *mut dl_rule_t, pos: c_int, var_idx: c_int);
+        pub fn dl_rule_head_const(rule: *mut dl_rule_t, pos: c_int, val: i64);
+        pub fn dl_rule_add_atom(rule: *mut dl_rule_t, pred: *const c_char, arity: c_int) -> c_int;
+        pub fn dl_body_set_var(
+            rule: *mut dl_rule_t,
+            body_idx: c_int,
+            pos: c_int,
+            var_idx: c_int,
+        );
+        pub fn dl_body_set_const(rule: *mut dl_rule_t, body_idx: c_int, pos: c_int, val: i64);
+        pub fn dl_rule_add_neg(rule: *mut dl_rule_t, pred: *const c_char, arity: c_int) -> c_int;
+        pub fn dl_rule_add_cmp(
+            rule: *mut dl_rule_t,
+            cmp_op: c_int,
+            lhs_var: c_int,
+            rhs_var: c_int,
+        ) -> c_int;
+        pub fn dl_rule_add_cmp_const(
+            rule: *mut dl_rule_t,
+            cmp_op: c_int,
+            lhs_var: c_int,
+            rhs_val: i64,
+        ) -> c_int;
+        pub fn dl_rule_add_assign(
+            rule: *mut dl_rule_t,
+            target_var: c_int,
+            op: c_int,
+            expr: *mut dl_expr_t,
+        ) -> c_int;
+        pub fn dl_rule_add_builtin(rule: *mut dl_rule_t, builtin_id: c_int, arity: c_int) -> c_int;
+        pub fn dl_rule_add_cmp_expr(
+            rule: *mut dl_rule_t,
+            cmp_op: c_int,
+            lhs: *mut dl_expr_t,
+            rhs: *mut dl_expr_t,
+        ) -> c_int;
+        pub fn dl_rule_add_interval(
+            rule: *mut dl_rule_t,
+            fact_var: c_int,
+            start_var: c_int,
+            end_var: c_int,
+        ) -> c_int;
+
+        // Expression tree builders
+        pub fn dl_expr_const(val: i64) -> *mut dl_expr_t;
+        pub fn dl_expr_var(var_idx: c_int) -> *mut dl_expr_t;
+        pub fn dl_expr_binop(
+            op: c_int,
+            left: *mut dl_expr_t,
+            right: *mut dl_expr_t,
+        ) -> *mut dl_expr_t;
+
+        // Rule compiler
+        pub fn dl_compile_rule(
+            prog: *mut dl_program_t,
+            rule: *mut dl_rule_t,
+            delta_pos: c_int,
+            rule_idx: c_int,
+            g: *mut td_graph_t,
+        ) -> *mut td_op_t;
+
+        // Provenance
+        pub fn dl_get_provenance(
+            prog: *mut dl_program_t,
+            pred_name: *const c_char,
+        ) -> *mut td_t;
+        pub fn dl_get_provenance_src_offsets(
+            prog: *mut dl_program_t,
+            pred_name: *const c_char,
+        ) -> *mut td_t;
+        pub fn dl_get_provenance_src_data(
+            prog: *mut dl_program_t,
+            pred_name: *const c_char,
+        ) -> *mut td_t;
+    }
+}

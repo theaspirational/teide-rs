@@ -25,6 +25,8 @@
 
 pub mod engine;
 pub mod ffi;
+#[cfg(feature = "datalog")]
+pub mod datalog;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod sql;

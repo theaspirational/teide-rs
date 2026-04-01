@@ -124,6 +124,7 @@ static void pass_type_inference(td_graph_t* g, td_op_t* root) {
                         if (ext->sort.columns[k] && !visited[ext->sort.columns[k]->id] && sp < (int)nc)
                             stack[sp++] = ext->sort.columns[k]->id;
                     break;
+                case OP_ANTIJOIN:
                 case OP_JOIN:
                     for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
                         if (ext->join.left_keys[k] && !visited[ext->join.left_keys[k]->id] && sp < (int)nc)
@@ -562,6 +563,7 @@ static void pass_constant_fold(td_graph_t* g, td_op_t* root) {
                         if (ext->sort.columns[k] && !visited[ext->sort.columns[k]->id] && sp < (int)nc)
                             stack[sp++] = ext->sort.columns[k]->id;
                     break;
+                case OP_ANTIJOIN:
                 case OP_JOIN:
                     for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
                         if (ext->join.left_keys[k] && !visited[ext->join.left_keys[k]->id] && sp < (int)nc)
@@ -685,7 +687,7 @@ static void mark_live(td_graph_t* g, td_op_t* root, bool* live) {
         /* H1: Traverse ext node children for structural ops so DCE does
            not incorrectly mark referenced nodes as dead. */
         if (n->opcode == OP_GROUP || n->opcode == OP_SORT ||
-            n->opcode == OP_JOIN  || n->opcode == OP_WINDOW_JOIN ||
+            n->opcode == OP_JOIN  || n->opcode == OP_ANTIJOIN || n->opcode == OP_WINDOW_JOIN ||
             n->opcode == OP_WINDOW ||
             n->opcode == OP_SELECT) {
             td_op_ext_t* ext = find_ext(g, nid);
@@ -708,7 +710,8 @@ static void mark_live(td_graph_t* g, td_op_t* root, bool* live) {
                                 stack[sp++] = ext->sort.columns[k]->id;
                         }
                         break;
-                    case OP_JOIN:
+                    case OP_ANTIJOIN:
+                case OP_JOIN:
                         for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
                             if (ext->join.left_keys[k] && !live[ext->join.left_keys[k]->id] && sp < (int)stack_cap)
                                 stack[sp++] = ext->join.left_keys[k]->id;
@@ -955,7 +958,8 @@ static td_op_t* graph_alloc_node_opt(td_graph_t* g) {
                                     g->ext_nodes[i]->sort.columns[k] =
                                         (td_op_t*)((char*)g->ext_nodes[i]->sort.columns[k] + delta);
                             break;
-                        case OP_JOIN:
+                        case OP_ANTIJOIN:
+                case OP_JOIN:
                             for (uint8_t k = 0; k < g->ext_nodes[i]->join.n_join_keys; k++) {
                                 if (g->ext_nodes[i]->join.left_keys[k])
                                     g->ext_nodes[i]->join.left_keys[k] =
@@ -1512,6 +1516,7 @@ static void pass_projection_pushdown(td_graph_t* g, td_op_t* root) {
                             if (qt < (int)nc) q[qt++] = ext->sort.columns[k]->id;
                         }
                     break;
+                case OP_ANTIJOIN:
                 case OP_JOIN:
                     for (uint8_t k = 0; k < ext->join.n_join_keys; k++) {
                         if (ext->join.left_keys[k] && !live[ext->join.left_keys[k]->id]) {

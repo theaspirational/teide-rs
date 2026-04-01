@@ -360,6 +360,96 @@ pub fn sym_intern(s: &str) -> Result<i64> {
     Ok(unsafe { ffi::td_sym_intern(s.as_ptr() as *const std::ffi::c_char, s.len()) })
 }
 
+/// Save the global symbol table to a file.
+pub fn sym_save(path: &str) -> Result<()> {
+    let _guard = acquire_existing_engine_guard().map_err(|_| Error::EngineNotInitialized)?;
+    let c_path = std::ffi::CString::new(path).map_err(|_| Error::InvalidInput)?;
+    let err = unsafe { ffi::td_sym_save(c_path.as_ptr()) };
+    if err != ffi::td_err_t::TD_OK {
+        Err(Error::Io)
+    } else {
+        Ok(())
+    }
+}
+
+/// Load the global symbol table from a file.
+pub fn sym_load(path: &str) -> Result<()> {
+    let _guard = acquire_existing_engine_guard().map_err(|_| Error::EngineNotInitialized)?;
+    let c_path = std::ffi::CString::new(path).map_err(|_| Error::InvalidInput)?;
+    let err = unsafe { ffi::td_sym_load(c_path.as_ptr()) };
+    if err != ffi::td_err_t::TD_OK {
+        Err(Error::Io)
+    } else {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Column builders — allocate raw td_t* vectors from Rust data
+// ---------------------------------------------------------------------------
+
+/// Allocate a TD_I64 vector from a Rust slice. Returns a raw td_t* (rc=1).
+pub fn alloc_i64_vec(data: &[i64]) -> Result<*mut ffi::td_t> {
+    let _guard = acquire_existing_engine_guard()?;
+    unsafe {
+        let vec = ffi::td_vec_from_raw(ffi::TD_I64, data.as_ptr() as *const _, data.len() as i64);
+        check_ptr(vec)
+    }
+}
+
+/// Allocate a TD_F64 vector from a Rust slice. Returns a raw td_t* (rc=1).
+pub fn alloc_f64_vec(data: &[f64]) -> Result<*mut ffi::td_t> {
+    let _guard = acquire_existing_engine_guard()?;
+    unsafe {
+        let vec = ffi::td_vec_from_raw(ffi::TD_F64, data.as_ptr() as *const _, data.len() as i64);
+        check_ptr(vec)
+    }
+}
+
+/// Allocate a TD_BOOL vector from a Rust slice. Returns a raw td_t* (rc=1).
+pub fn alloc_bool_vec(data: &[bool]) -> Result<*mut ffi::td_t> {
+    let _guard = acquire_existing_engine_guard()?;
+    unsafe {
+        let vec = ffi::td_vec_from_raw(ffi::TD_BOOL, data.as_ptr() as *const _, data.len() as i64);
+        check_ptr(vec)
+    }
+}
+
+/// Allocate a TD_SYM vector from a slice of pre-interned symbol IDs (i64).
+pub fn alloc_sym_vec(sym_ids: &[i64]) -> Result<*mut ffi::td_t> {
+    let _guard = acquire_existing_engine_guard()?;
+    unsafe {
+        let vec = ffi::td_sym_vec_new(ffi::TD_SYM_W64, sym_ids.len() as i64);
+        let vec = check_ptr(vec)?;
+        for &id in sym_ids {
+            let next = ffi::td_vec_append(vec, &id as *const i64 as *const _);
+            if next.is_null() || ffi::td_is_err(next) {
+                ffi::td_release(vec);
+                return Err(Error::Oom);
+            }
+        }
+        Ok(vec)
+    }
+}
+
+/// Allocate a TD_SYM vector by interning string slices. Returns a raw td_t* (rc=1).
+pub fn alloc_str_vec(strings: &[&str]) -> Result<*mut ffi::td_t> {
+    let _guard = acquire_existing_engine_guard()?;
+    unsafe {
+        let vec = ffi::td_sym_vec_new(ffi::TD_SYM_W64, strings.len() as i64);
+        let vec = check_ptr(vec)?;
+        for &s in strings {
+            let id = ffi::td_sym_intern(s.as_ptr() as *const std::ffi::c_char, s.len());
+            let next = ffi::td_vec_append(vec, &id as *const i64 as *const _);
+            if next.is_null() || ffi::td_is_err(next) {
+                ffi::td_release(vec);
+                return Err(Error::Oom);
+            }
+        }
+        Ok(vec)
+    }
+}
+
 /// Engine context. Initializes the heap allocator, symbol table, and thread
 /// pool on construction. Tears them down in reverse order on drop.
 ///
@@ -568,6 +658,43 @@ impl Table {
         })
     }
 
+    /// Build a Table from pre-allocated column vectors and their names.
+    ///
+    /// # Safety
+    /// Each element of `cols` must be a valid td_t* vector obtained from `alloc_*_vec`.
+    pub unsafe fn from_columns(names: &[&str], cols: &[*mut ffi::td_t]) -> Result<Self> {
+        if names.len() != cols.len() {
+            return Err(Error::Length);
+        }
+        let engine = acquire_existing_engine_guard()?;
+        let tbl = unsafe { ffi::td_table_new(names.len() as i64) };
+        if tbl.is_null() || ffi::td_is_err(tbl) {
+            return Err(Error::Oom);
+        }
+        let mut tbl = tbl;
+        for (name, &col) in names.iter().zip(cols.iter()) {
+            if col.is_null() || ffi::td_is_err(col) {
+                unsafe { ffi::td_release(tbl) };
+                return Err(Error::NullPointer);
+            }
+            let name_id =
+                unsafe { ffi::td_sym_intern(name.as_ptr() as *const std::ffi::c_char, name.len()) };
+            unsafe { ffi::td_retain(col) };
+            let next = unsafe { ffi::td_table_add_col(tbl, name_id, col) };
+            if next.is_null() || ffi::td_is_err(next) {
+                unsafe { ffi::td_release(col) };
+                unsafe { ffi::td_release(tbl) };
+                return Err(Error::Oom);
+            }
+            tbl = next;
+        }
+        Ok(Table {
+            raw: tbl,
+            engine,
+            _not_send_sync: PhantomData,
+        })
+    }
+
     /// Create a shared reference to this table by incrementing the C ref count.
     /// Both the original and the clone will call `td_release` on drop.
     pub fn clone_ref(&self) -> Self {
@@ -759,6 +886,21 @@ impl Table {
     pub fn write_csv(&self, path: &str) -> Result<()> {
         let c_path = CString::new(path).map_err(|_| Error::InvalidInput)?;
         let err = unsafe { ffi::td_write_csv(self.raw, c_path.as_ptr()) };
+        if err != ffi::td_err_t::TD_OK {
+            Err(Error::from_code(err))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Save this table in splayed (column-per-file) format.
+    pub fn save_splayed(&self, dir: &str, sym_path: Option<&str>) -> Result<()> {
+        let c_dir = CString::new(dir).map_err(|_| Error::InvalidInput)?;
+        let c_sym = sym_path
+            .map(|s| CString::new(s).map_err(|_| Error::InvalidInput))
+            .transpose()?;
+        let sym_ptr = c_sym.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
+        let err = unsafe { ffi::td_splay_save(self.raw, c_dir.as_ptr(), sym_ptr) };
         if err != ffi::td_err_t::TD_OK {
             Err(Error::from_code(err))
         } else {
@@ -2440,6 +2582,10 @@ pub struct HnswIndex {
     dim: i32,
     _engine: Arc<EngineGuard>,
 }
+
+// SAFETY: The HNSW index is immutable after build — read-only search is thread-safe.
+unsafe impl Send for HnswIndex {}
+unsafe impl Sync for HnswIndex {}
 
 impl HnswIndex {
     /// Build an HNSW index from embedding data.

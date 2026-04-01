@@ -14,6 +14,7 @@ links = "teide"
 default = []
 cli = ["reedline", "clap", "nu-ansi-term"]
 server = ["tokio", "pgwire", "async-trait", "futures", "clap"]
+datalog = []
 
 [dependencies]
 sqlparser = { version = "0.53", features = ["visitor"] }

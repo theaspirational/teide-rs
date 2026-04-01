@@ -91,6 +91,8 @@ static const char* opcode_name(uint16_t op) {
         case OP_SORT:          return "SORT";
         case OP_GROUP:         return "GROUP";
         case OP_JOIN:          return "JOIN";
+        case OP_ANTIJOIN:      return "ANTIJOIN";
+        case OP_UNION_ALL:     return "UNION_ALL";
         case OP_WINDOW_JOIN:   return "WINDOW_JOIN";
         case OP_SELECT:        return "SELECT";
         case OP_HEAD:          return "HEAD";
@@ -179,8 +181,13 @@ static void dump_node(FILE* f, td_graph_t* g, td_op_t* node, int depth) {
                 const char* jt = "INNER";
                 if (ext->join.join_type == 1) jt = "LEFT";
                 else if (ext->join.join_type == 2) jt = "FULL";
+                else if (ext->join.join_type == 3) jt = "ANTI";
                 fprintf(f, "(%s, keys=%u)", jt, ext->join.n_join_keys);
             }
+            break;
+        case OP_ANTIJOIN:
+            if (ext)
+                fprintf(f, "(ANTI, keys=%u)", ext->join.n_join_keys);
             break;
         case OP_GROUP:
             if (ext)
